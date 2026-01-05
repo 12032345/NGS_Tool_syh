@@ -2,20 +2,22 @@ import subprocess
 import matplotlib.pyplot as plt
 import numpy as np
 import os
+import sys
 from datetime import datetime
 import argparse
+import re
 
 def get_counts(bam_file, chrom, start, end, bin_size):
     """使用samtools计算指定区间内每个bin的符合条件的reads数"""
     bins = range(start, end, bin_size)
     counts = []
     
-    # 检查samtools是否可用
+    # 检查samtools是否可用；缺失则视为致命错误，退出以通知上层脚本
     try:
         subprocess.run(['samtools', '--version'], capture_output=True, check=True)
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        print("[ERROR] samtools not found in PATH")
-        return list(bins), [0] * len(bins)
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        # 明确报错并抛出异常让调用方处理（或程序退出）
+        raise FileNotFoundError("samtools not found in PATH") from e
     
     for b_start in bins:
         b_end = b_start + bin_size
@@ -124,7 +126,7 @@ def main():
     if not os.path.exists(bam_path + ".bai"):
         print(f"[WARNING] 未找到索引文件 (.bai): {bam_path}.bai")
 
-    # 检查BAM文件是否可读
+    # 检查BAM文件是否可读（samtools 必需）
     try:
         # 使用samtools view测试BAM文件
         result = subprocess.run(['samtools', 'view', '-c', bam_path], 
@@ -133,10 +135,10 @@ def main():
         print(f"[INFO] BAM文件包含 {total_reads:,} 条reads")
     except subprocess.CalledProcessError as e:
         print(f"[ERROR] 无法读取BAM文件: {e}")
-        return
+        sys.exit(1)
     except FileNotFoundError:
         print("[ERROR] samtools not found in PATH")
-        return
+        sys.exit(1)
 
     # 2. 输出目录设置
     out_dir = args.output
@@ -144,6 +146,9 @@ def main():
     
     # 获取文件基础名用于生成文件名
     bam_basename = os.path.splitext(os.path.basename(bam_path))[0]
+    # 统一样本前缀：去掉常见的对齐/排序后缀，以匹配 worf_seq.bash 中使用的 folder basename
+    # 例如: UDI001_aligned_minimap.sorted -> UDI001
+    sample_prefix = re.sub(r'(_aligned_minimap)?(\.sorted|_sorted)?$', '', bam_basename)
 
     # 3. 设置目标染色体和位置
     target_chrom = args.chromosome
@@ -182,11 +187,17 @@ def main():
         print(f"\n[INFO] [1/2] 正在分析 {target_chrom} 全长背景 (长度: {chrom_length/1e6:.2f} Mb)...")
         try:
             wgs_bins, wgs_counts = get_counts(bam_path, target_chrom, 0, chrom_length, wgs_bin)
-            wgs_fname = os.path.join(out_dir, f"{bam_basename}_chromosome_{target_chrom}_step{wgs_bin}.png")
+            wgs_fname = os.path.join(out_dir, f"{sample_prefix}_chromosome_{target_chrom}_step{wgs_bin}.png")
             plot_data(wgs_bins, wgs_counts, target_chrom, wgs_bin,
                      f"WORF-Seq Chromosome-wide Coverage\\n{target_chrom} (Step: {wgs_bin:,} bp)", 
                      wgs_fname, target_pos=target_pos)
-            generated_files.append(wgs_fname)
+            if os.path.exists(wgs_fname) and os.path.getsize(wgs_fname) > 0:
+                generated_files.append(wgs_fname)
+            else:
+                print(f"[WARN] 未生成全染色体图: {wgs_fname}")
+        except FileNotFoundError as e:
+            print(f"[ERROR] 全染色体分析失败 (依赖缺失): {e}")
+            sys.exit(1)
         except Exception as e:
             print(f"[ERROR] 全染色体分析失败: {e}")
     else:
@@ -199,19 +210,23 @@ def main():
 
     print(f"[INFO] [2/2] 正在分析目标区域 (+/- 50kb 范围)...")
     try:
-        m_bins, m_counts = get_counts(samfile, target_chrom, micro_start, micro_end, micro_bin)
-        target_fname = os.path.join(out_dir, f"{bam_basename}_target_region_{target_chrom}_{target_pos}.png")
+        m_bins, m_counts = get_counts(bam_path, target_chrom, micro_start, micro_end, micro_bin)
+        target_fname = os.path.join(out_dir, f"{sample_prefix}_target_region_{target_chrom}_{target_pos}.png")
         plot_data(m_bins, m_counts, target_chrom, micro_bin,
                  f"WORF-Seq Target Region Coverage\\n{target_chrom}:{micro_start:,}-{micro_end:,}", 
                  target_fname, target_pos=target_pos)
-        generated_files.append(target_fname)
+        if os.path.exists(target_fname) and os.path.getsize(target_fname) > 0:
+            generated_files.append(target_fname)
+        else:
+            print(f"[WARN] 未生成目标区域图: {target_fname}")
+    except FileNotFoundError as e:
+        print(f"[ERROR] 目标区域分析失败 (依赖缺失): {e}")
+        sys.exit(1)
     except Exception as e:
         print(f"[ERROR] 目标区域分析失败: {e}")
-
-    samfile.close()
     
     # 生成摘要报告
-    summary_fname = os.path.join(out_dir, f"{bam_basename}_worf_seq_summary.txt")
+    summary_fname = os.path.join(out_dir, f"{sample_prefix}_worf_seq_summary.txt")
     try:
         with open(summary_fname, 'w') as f:
             f.write("WORF-Seq Analysis Summary Report\\n")
@@ -230,8 +245,11 @@ def main():
         print(f"[INFO] 摘要报告已保存: {summary_fname}")
     except Exception as e:
         print(f"[ERROR] 生成摘要报告失败: {e}")
+    if not generated_files:
+        print("\n[ERROR] 分析未生成任何输出文件，可能发生错误")
+        sys.exit(1)
 
-    print(f"\\n[SUCCESS] 分析完成！生成了 {len(generated_files)} 个文件：")
+    print(f"\n[SUCCESS] 分析完成！生成了 {len(generated_files)} 个文件：")
     for file in generated_files:
         print(f"[INFO]   - {file}")
 

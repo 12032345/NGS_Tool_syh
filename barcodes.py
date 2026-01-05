@@ -4,6 +4,10 @@
 包含96个标准 barcode 序列
 """
 
+import os
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 def load_barcodes_from_file(file_path):
     """从文件中加载 barcode 序列"""
     barcodes = {}
@@ -38,8 +42,8 @@ def get_default_barcodes():
         6: "GCCAATGT"
     }
 
-# 从文件加载 barcode 序列
-BARCODE_FILE = "/home/sunyuhong/software/NGS_Tool_syh/Egg_Indel/barcode.txt"
+# 从文件加载 barcode 序列（项目内相对路径）
+BARCODE_FILE = os.path.join(BASE_DIR, "Egg_Indel", "barcode.txt")
 BARCODES = load_barcodes_from_file(BARCODE_FILE)
 
 def get_barcode_sequence(barcode_num):

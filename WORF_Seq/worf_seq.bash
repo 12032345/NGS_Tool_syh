@@ -32,23 +32,17 @@ fi
 STEP_SIZE=${STEP_SIZE:-100000}
 BACKGROUND_ANALYSIS=${BACKGROUND_ANALYSIS:-true}
 
-# 设置工作目录和日志文件
+# 设置工作目录和日志文件：统一使用时间戳临时目录，避免目标目录权限问题
 FOLDER_BASENAME=$(basename "$FOLDER_NAME")
+TIMESTAMP=$(date +%s)
+WORK_DIR="/tmp/worf_seq_${FOLDER_BASENAME}_${TIMESTAMP}"
+mkdir -p "$WORK_DIR"
+LOG_FILE="${WORK_DIR}/${FOLDER_BASENAME}_worf_seq_pipeline.log"
+echo "[INFO] Using temp work directory: $WORK_DIR" 
+echo "[INFO] 原始数据仍从目录读取: $FOLDER_NAME"
 
-# 检查目标目录是否有写入权限
-if [[ -w "$FOLDER_NAME" ]]; then
-    WORK_DIR="$FOLDER_NAME"
-    LOG_FILE="${FOLDER_NAME}/${FOLDER_BASENAME}_worf_seq_pipeline.log"
-    echo "[INFO] Using target directory for work: $WORK_DIR" 
-else
-    # 使用临时目录
-    TEMP_DIR="/tmp/worf_seq_${FOLDER_BASENAME}_$$"
-    mkdir -p "$TEMP_DIR"
-    WORK_DIR="$TEMP_DIR"
-    LOG_FILE="${TEMP_DIR}/${FOLDER_BASENAME}_worf_seq_pipeline.log"
-    echo "[INFO] Target directory not writable, using temp directory: $WORK_DIR"
-    echo "[WARNING] Results will be available in temp directory: $WORK_DIR"
-fi
+# 确保管道失败能正确上报（防止 tee 掩盖子进程退出码）
+set -o pipefail
 
 echo "[INFO] WORF-Seq Analysis Pipeline Started" | tee "$LOG_FILE"
 echo "[INFO] Timestamp: $(date)" | tee -a "$LOG_FILE"
@@ -104,8 +98,15 @@ else
             exit 1
         fi
     else
-        echo "[ERROR] fastp not found in PATH" | tee -a "$LOG_FILE"
-        exit 1
+        # fastp 缺失时兜底：若已存在清洗文件则继续，否则使用原始文件作为清洗输入
+        if [[ -f "$CLEAN_R1" && -f "$CLEAN_R2" && -s "$CLEAN_R1" && -s "$CLEAN_R2" ]]; then
+            echo "[WARN] fastp 未安装，但检测到现有clean文件，继续后续流程" | tee -a "$LOG_FILE"
+        else
+            echo "[WARN] fastp 未安装，使用原始文件直接作为 clean 输入" | tee -a "$LOG_FILE"
+            ln -sf "$RAW_R1" "$CLEAN_R1"
+            ln -sf "$RAW_R2" "$CLEAN_R2"
+            echo "[INFO] 已创建符号链接替代 clean 文件" | tee -a "$LOG_FILE"
+        fi
     fi
 fi
 echo "========================================" | tee -a "$LOG_FILE"
@@ -113,22 +114,51 @@ echo "========================================" | tee -a "$LOG_FILE"
 # 步骤2: 序列比对到参考基因组
 echo "[INFO] 步骤2: 序列比对 (minimap2)" | tee -a "$LOG_FILE"
 SAM_FILE="${WORK_DIR}/${FOLDER_BASENAME}_aligned_minimap.sam"
+# 提前定义BAM路径用于跳过比对的检测
+BAM_FILE="${WORK_DIR}/${FOLDER_BASENAME}_aligned_minimap.sorted.bam"
+BAM_INDEX="${BAM_FILE}.bai"
 HG38_FA="${REF_DIR}/hg38.fa"
 HG38_MMI="${REF_DIR}/hg38.mmi"
+RUN_ALIGNMENT=true
 
-# 检查SAM文件是否已存在且有效
-if [[ -f "$SAM_FILE" && -s "$SAM_FILE" ]]; then
-    # 验证现有SAM文件的头部信息
-    if head -n 1 "$SAM_FILE" | grep -q "^@"; then
-        SAM_LINES=$(wc -l < "$SAM_FILE")
-        echo "[SKIP] SAM文件已存在且有效，跳过序列比对步骤" | tee -a "$LOG_FILE"
-        echo "[INFO] 现有文件: $SAM_FILE ($(stat -c%s "$SAM_FILE" | numfmt --to=iec)iB, $SAM_LINES lines)" | tee -a "$LOG_FILE"
+# 如果之前因权限使用过临时目录，尝试复用已有 SAM/BAM（避免重复跑 minimap2）
+TMP_GLOB="/tmp/worf_seq_${FOLDER_BASENAME}_*"
+FOUND_TMP_BAM=$(ls $TMP_GLOB/${FOLDER_BASENAME}_aligned_minimap.sorted.bam 2>/dev/null | head -n 1)
+FOUND_TMP_SAM=$(ls $TMP_GLOB/${FOLDER_BASENAME}_aligned_minimap.sam 2>/dev/null | head -n 1)
+
+if [[ ! -s "$BAM_FILE" && -n "$FOUND_TMP_BAM" ]]; then
+    echo "[INFO] 复用临时目录中的BAM: $FOUND_TMP_BAM" | tee -a "$LOG_FILE"
+    ln -sf "$FOUND_TMP_BAM" "$BAM_FILE"
+    if [[ -f "${FOUND_TMP_BAM}.bai" ]]; then
+        ln -sf "${FOUND_TMP_BAM}.bai" "$BAM_INDEX"
+    fi
+fi
+
+if [[ ! -s "$SAM_FILE" && -n "$FOUND_TMP_SAM" ]]; then
+    echo "[INFO] 复用临时目录中的SAM: $FOUND_TMP_SAM" | tee -a "$LOG_FILE"
+    ln -sf "$FOUND_TMP_SAM" "$SAM_FILE"
+fi
+
+# 若已存在排序BAM，直接跳过比对
+if [[ -f "$BAM_FILE" && -s "$BAM_FILE" ]]; then
+    echo "[SKIP] 检测到已存在排序BAM，跳过序列比对" | tee -a "$LOG_FILE"
+    RUN_ALIGNMENT=false
+else
+    # 检查SAM文件是否已存在且有效
+    if [[ -f "$SAM_FILE" && -s "$SAM_FILE" ]]; then
+        # 验证现有SAM文件的头部信息
+        if head -n 1 "$SAM_FILE" | grep -q "^@"; then
+            SAM_LINES=$(wc -l < "$SAM_FILE")
+            echo "[SKIP] SAM文件已存在且有效，跳过序列比对步骤" | tee -a "$LOG_FILE"
+            echo "[INFO] 现有文件: $SAM_FILE ($(stat -c%s "$SAM_FILE" | numfmt --to=iec)iB, $SAM_LINES lines)" | tee -a "$LOG_FILE"
+            RUN_ALIGNMENT=false
+        else
+            echo "[WARN] 现有SAM文件无效，重新进行序列比对" | tee -a "$LOG_FILE"
+            RUN_ALIGNMENT=true
+        fi
     else
-        echo "[WARN] 现有SAM文件无效，重新进行序列比对" | tee -a "$LOG_FILE"
         RUN_ALIGNMENT=true
     fi
-else
-    RUN_ALIGNMENT=true
 fi
 
 if [[ "$RUN_ALIGNMENT" == "true" ]]; then
@@ -160,8 +190,17 @@ if [[ "$RUN_ALIGNMENT" == "true" ]]; then
             exit 1
         fi
     else
-        echo "[ERROR] minimap2 not found in PATH" | tee -a "$LOG_FILE"
-        exit 1
+        # minimap2 缺失时兜底：若已有有效 SAM/BAM 则跳过；否则退出
+        if [[ -f "$BAM_FILE" && -s "$BAM_FILE" ]]; then
+            echo "[WARN] minimap2 未安装，检测到现有BAM，跳过比对步骤" | tee -a "$LOG_FILE"
+            RUN_ALIGNMENT=false
+        elif [[ -f "$SAM_FILE" && -s "$SAM_FILE" ]]; then
+            echo "[WARN] minimap2 未安装，检测到现有SAM，跳过比对步骤" | tee -a "$LOG_FILE"
+            RUN_ALIGNMENT=false
+        else
+            echo "[ERROR] minimap2 not found in PATH，且未检测到已有SAM/BAM可用" | tee -a "$LOG_FILE"
+            exit 1
+        fi
     fi
 fi
 echo "========================================" | tee -a "$LOG_FILE"
@@ -257,13 +296,16 @@ if [[ "$PLOTS_EXIST" == "true" ]]; then
 else
     if [[ -f "$WGS_SCRIPT" ]]; then
         echo "[INFO] Running WGSmapping.py..." | tee -a "$LOG_FILE"
-        if python3 "$WGS_SCRIPT" \
+        # 运行 WGSmapping 并捕获子进程的退出码（避免 tee 掩盖）
+        python3 "$WGS_SCRIPT" \
             --bam "$BAM_FILE" \
             --chromosome "$CHROMOSOME" \
             --center "$CENTER_POSITION" \
             --step "$STEP_SIZE" \
             --background "$BACKGROUND_ANALYSIS" \
-            --output "$WORK_DIR" 2>&1 | tee -a "$LOG_FILE"; then
+            --output "$WORK_DIR" 2>&1 | tee -a "$LOG_FILE"
+        PY_EXIT=${PIPESTATUS[0]}
+        if [[ $PY_EXIT -eq 0 ]]; then
             echo "[SUCCESS] 染色体比对图生成完成" | tee -a "$LOG_FILE"
             echo "[INFO] 生成的文件:" | tee -a "$LOG_FILE"
             for PLOT_FILE in "$EXPECTED_TARGET_PLOT" "$EXPECTED_CHROM_PLOT" "$EXPECTED_SUMMARY"; do
@@ -272,8 +314,8 @@ else
                 fi
             done
         else
-            echo "[ERROR] WGSmapping.py failed" | tee -a "$LOG_FILE"
-            exit 1
+            echo "[ERROR] WGSmapping.py failed (exit code $PY_EXIT)" | tee -a "$LOG_FILE"
+            exit $PY_EXIT
         fi
     else
         echo "[ERROR] WGSmapping.py not found: $WGS_SCRIPT" | tee -a "$LOG_FILE"
@@ -285,8 +327,13 @@ echo "========================================" | tee -a "$LOG_FILE"
 # 统计信息
 echo "[INFO] 分析完成统计:" | tee -a "$LOG_FILE"
 echo "[INFO]   - 输入文件: 2" | tee -a "$LOG_FILE"
-echo "[INFO]   - 输出BAM文件: $(ls -la "$BAM_FILE" 2>/dev/null | awk '{print $5}' | numfmt --to=iec)iB" | tee -a "$LOG_FILE"
-echo "[INFO]   - 生成图片: $(find "$FOLDER_NAME" -name "*.png" -o -name "*.pdf" | wc -l)" | tee -a "$LOG_FILE"
+if [[ -f "$BAM_FILE" && -s "$BAM_FILE" ]]; then
+    echo "[INFO]   - 输出BAM文件: $(stat -c%s "$BAM_FILE" | numfmt --to=iec)iB" | tee -a "$LOG_FILE"
+else
+    echo "[INFO]   - 输出BAM文件: (not found)" | tee -a "$LOG_FILE"
+fi
+IMG_COUNT=$(find "$WORK_DIR" -maxdepth 1 -type f \( -name "*.png" -o -name "*.pdf" \) | wc -l)
+echo "[INFO]   - 生成图片: $IMG_COUNT" | tee -a "$LOG_FILE"
 
 echo "[SUCCESS] WORF-Seq Analysis Pipeline Completed Successfully!" | tee -a "$LOG_FILE"
 echo "[INFO] Timestamp: $(date)" | tee -a "$LOG_FILE"
@@ -296,21 +343,22 @@ echo "[INFO] Log file: $LOG_FILE" | tee -a "$LOG_FILE"
 echo "" | tee -a "$LOG_FILE"
 echo "========================================" | tee -a "$LOG_FILE"
 echo "📁 RESULTS LOCATION:" | tee -a "$LOG_FILE"
-
-if [[ "$WORK_DIR" == "$FOLDER_NAME" ]]; then
-    echo "[INFO] Results are in the original directory: $WORK_DIR" | tee -a "$LOG_FILE"
-    echo "[INFO] Please check the following files:" | tee -a "$LOG_FILE"
-else
-    echo "[WARNING] Results are in temporary directory due to permission issues:" | tee -a "$LOG_FILE"
-    echo "[INFO] Temporary directory: $WORK_DIR" | tee -a "$LOG_FILE"
-    echo "[INFO] Please copy results to your desired location before the system reboots" | tee -a "$LOG_FILE"
-fi
+echo "[INFO] Results are in temporary directory: $WORK_DIR" | tee -a "$LOG_FILE"
+echo "[INFO] Please copy results to your desired location before the system reboots" | tee -a "$LOG_FILE"
 
 echo "[INFO] Generated files:" | tee -a "$LOG_FILE"
-echo "[INFO]   - BAM: $BAM_FILE" | tee -a "$LOG_FILE"
-echo "[INFO]   - Target plot: $EXPECTED_TARGET_PLOT" | tee -a "$LOG_FILE"
-echo "[INFO]   - Chromosome plot: $EXPECTED_CHROM_PLOT" | tee -a "$LOG_FILE"
-echo "[INFO]   - Summary: $EXPECTED_SUMMARY" | tee -a "$LOG_FILE"
+if [[ -f "$BAM_FILE" && -s "$BAM_FILE" ]]; then
+    echo "[INFO]   - BAM: $BAM_FILE" | tee -a "$LOG_FILE"
+fi
+if [[ -f "$EXPECTED_TARGET_PLOT" && -s "$EXPECTED_TARGET_PLOT" ]]; then
+    echo "[INFO]   - Target plot: $EXPECTED_TARGET_PLOT" | tee -a "$LOG_FILE"
+fi
+if [[ -f "$EXPECTED_CHROM_PLOT" && -s "$EXPECTED_CHROM_PLOT" ]]; then
+    echo "[INFO]   - Chromosome plot: $EXPECTED_CHROM_PLOT" | tee -a "$LOG_FILE"
+fi
+if [[ -f "$EXPECTED_SUMMARY" && -s "$EXPECTED_SUMMARY" ]]; then
+    echo "[INFO]   - Summary: $EXPECTED_SUMMARY" | tee -a "$LOG_FILE"
+fi
 
 echo "========================================" | tee -a "$LOG_FILE"
 

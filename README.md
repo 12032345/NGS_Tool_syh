@@ -160,4 +160,29 @@ NGS_Tool_syh/
 
 ## 🤝 贡献
 
-欢迎提交Issue和Pull Request来改进这个项目！# NGS_Tool_syh
+欢迎提交Issue和Pull Request来改进这个项目！
+
+## 🗂 更新日志 (Changelog)
+
+2025-12-31 — v0.9.0 by alex90thu
+- 集成 `WORF-Seq` 前后端改进：
+  - 将 `worf_seq.bash` 改为在 `/tmp/worf_seq_<name>_<ts>` 写入临时结果，避免写入只读目录。
+  - 为缺失工具（fastp/minimap2/samtools）添加兜底逻辑和复用临时输出的能力，减少重复计算。
+  - 修复 `WGSmapping.py` 中的文件名与变量使用问题，改为在缺少 `samtools` 时返回非零并清晰报错，只有实际生成文件时才标记为成功。
+  - 结果查找和打包逻辑改为基于实际文件名的 glob 匹配，兼容旧命名规则（带 `_aligned_minimap.sorted` 前缀）。
+
+2025-12-30 — v0.8.0
+- Streamlit 前端 (`app.py`) 增强：
+  - 新增 NCBI 基因检索助手（支持自动填充染色体/起止/中心位置）并将查询日志写入 `logs/gene_lookup.log`。
+  - 添加基因收藏夹功能（持久化至 `logs/gene_favorites.json`），可在 UI 中快速调用历史记录。
+  - 将项目脚本路径改为基于项目根目录的相对路径，修复绝对路径导致的权限问题。
+  - 改进 WORF-Seq 结果展示：仅显示实际存在的文件并支持按需打包下载（PNG + TXT，排除 BAM）。
+
+2025-12-25 — v0.7.0
+- 基础重构与修复：
+  - 修复 `barcodes.py` 中的条码文件路径读取，改为项目相对路径。
+  - 替换已弃用的 `st.experimental_rerun` 为 `st.rerun`。
+
+请在 Release 页或 CHANGELOG 文件中查看更早历史记录。其他贡献者欢迎在项目中署名并通过 Pull Request 补充。
+
+# NGS_Tool_syh

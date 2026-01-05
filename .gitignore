@@ -35,3 +35,5 @@ fastp.json
 # 测试文件
 *.test
 demo_grid.html
+=1.28.0
+.gitignore

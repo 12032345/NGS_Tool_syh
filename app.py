@@ -6,8 +6,9 @@ from datetime import datetime
 import pandas as pd
 import threading
 import base64
-from barcodes import BARCODES, get_barcode_sequence, generate_barcode_file, get_barcode_display_name
 import json
+import requests
+from barcodes import BARCODES, get_barcode_sequence, generate_barcode_file, get_barcode_display_name
 
 # 设置页面配置
 st.set_page_config(
@@ -16,6 +17,18 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# 项目根目录与日志目录
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+GENE_LOG_FILE = os.path.join(LOG_DIR, "gene_lookup.log")
+GENE_FAV_FILE = os.path.join(LOG_DIR, "gene_favorites.json")
+
+
+def rel_path(*parts):
+    """基于项目根目录拼接路径"""
+    return os.path.join(BASE_DIR, *parts)
 
 # 自定义CSS
 st.markdown("""
@@ -286,7 +299,7 @@ PROJECTS = {
         "name": "🧬 Egg Indel Analysis",
         "description": "CRISPR基因编辑indel突变分析，自动处理双端测序数据并计算编辑效率",
         "status": "available",
-        "script": "/home/sunyuhong/software/NGS_Tool_syh/Egg_Indel/script/egg_insel.bash",
+        "script": rel_path("Egg_Indel", "script", "egg_insel.bash"),
         "example": {
             "seq1": "/data/sunyuhong/data/20250720_ShangHaiJiaoTongDaXue-sunyuhong-1_1/00.mergeRawFq/test/UDI001_raw_1.fq.gz",
             "seq2": "/data/sunyuhong/data/20250720_ShangHaiJiaoTongDaXue-sunyuhong-1_1/00.mergeRawFq/test/UDI001_raw_2.fq.gz", 
@@ -306,7 +319,7 @@ PROJECTS = {
         "name": "🔬 Nanobody Analysis",
         "description": "纳米抗体序列分析，包括序列拼接、trim和结果统计",
         "status": "available", 
-        "script": "/home/sunyuhong/software/NGS_Tool_syh/Nanobody/nanobody.bash",
+        "script": rel_path("Nanobody", "nanobody.bash"),
         "example": {
             "seq1": "/data/sunyuhong/data/20251214_ShangHaiJiaoTongDaXue-hanpeijin-1_1/00.mergeRawFq/NGS_TSLP1-HIGH/NGS_TSLP1-HIGH_raw_1.fq.gz",
             "seq2": "/data/sunyuhong/data/20251214_ShangHaiJiaoTongDaXue-hanpeijin-1_1/00.mergeRawFq/NGS_TSLP1-HIGH/NGS_TSLP1-HIGH_raw_2.fq.gz",
@@ -322,7 +335,7 @@ PROJECTS = {
         "name": "📊 WORF-Seq Analysis", 
         "description": "WORF序列高通量ORF筛选分析，包含质控、比对、可视化和全染色体背景分析",
         "status": "available",
-        "script": "/home/sunyuhong/software/NGS_Tool_syh/WORF_Seq/worf_seq.bash",
+        "script": rel_path("WORF_Seq", "worf_seq.bash"),
         "example": {
             "folder_name": "/data/lulab_commonspace/sunyuhong/20251216_ShangHaiJiaoTongDaXue-yaozonglin-1_2/00.mergeRawFq/UDI002",
             "chromosome": "chr6",
@@ -431,6 +444,174 @@ def check_file_exists(file_path):
         return True, "文件存在"
     else:
         return False, f"文件不存在: {file_path}"
+
+
+def log_gene_lookup(message):
+    """将基因定位助手的调试信息写入日志文件"""
+    try:
+        with open(GENE_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}\n")
+    except Exception:
+        pass
+
+
+def load_gene_favorites():
+    """加载基因收藏记录"""
+    if not os.path.exists(GENE_FAV_FILE):
+        return []
+    try:
+        with open(GENE_FAV_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_gene_favorites(favs):
+    """保存基因收藏记录"""
+    try:
+        with open(GENE_FAV_FILE, "w", encoding="utf-8") as f:
+            json.dump(favs, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log_gene_lookup(f"save favorites error: {e}")
+
+
+def add_gene_favorite(gene_symbol, organism, gene_info):
+    """添加收藏（去重，按symbol+organism）"""
+    favs = load_gene_favorites()
+    key = (gene_symbol.strip().upper(), organism.strip())
+    exists = any(
+        fav.get("symbol", "").upper() == key[0] and fav.get("organism") == key[1]
+        for fav in favs
+    )
+    if exists:
+        return False
+    entry = {
+        "symbol": gene_symbol.strip(),
+        "organism": organism.strip(),
+        "chromosome": gene_info.get("chromosome"),
+        "start": gene_info.get("start"),
+        "end": gene_info.get("end"),
+        "center": gene_info.get("center"),
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    favs.append(entry)
+    save_gene_favorites(favs)
+    return True
+
+
+def fetch_gene_coordinates(gene_symbol, organism="Homo sapiens"):
+    """通过NCBI E-utilities查询基因坐标，返回染色体、起止位置、中心点"""
+    if not gene_symbol:
+        return None, "请输入基因名称"
+
+    try:
+        query_term = f"{gene_symbol}[gene] AND {organism}[organism]"
+        log_gene_lookup(f"esearch term='{query_term}'")
+
+        esearch_params = {
+            "db": "gene",
+            "term": query_term,
+            "retmode": "json",
+            "retmax": 5,
+        }
+        esearch_resp = requests.get(
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+            params=esearch_params,
+            timeout=10,
+        )
+        log_gene_lookup(f"esearch status={esearch_resp.status_code} url={esearch_resp.url}")
+        esearch_resp.raise_for_status()
+        esearch_data = esearch_resp.json()
+        id_list = esearch_data.get("esearchresult", {}).get("idlist", [])
+        log_gene_lookup(f"esearch idlist={id_list}")
+        if not id_list:
+            return None, "未找到匹配的基因，请输入官方基因符号（如 TP53, HLA-C）"
+
+        gene_id = id_list[0]
+        esummary_params = {"db": "gene", "id": gene_id, "retmode": "json"}
+        esummary_resp = requests.get(
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
+            params=esummary_params,
+            timeout=10,
+        )
+        log_gene_lookup(f"esummary status={esummary_resp.status_code} url={esummary_resp.url}")
+        esummary_resp.raise_for_status()
+        esummary_data = esummary_resp.json()
+
+        # esummary 返回的结构在 result 下，也可能出现在 DocumentSummarySet 下，双重兜底
+        docsum = esummary_data.get("result", {}).get(str(gene_id), {})
+        if not docsum and "DocumentSummarySet" in esummary_data:
+            summaries = esummary_data.get("DocumentSummarySet", {}).get("DocumentSummary", [])
+            if summaries:
+                docsum = summaries[0]
+
+        genomic_info = docsum.get("genomicinfo") or docsum.get("GenomicInfo") or []
+        if isinstance(genomic_info, dict):
+            genomic_info = [genomic_info]
+
+        log_gene_lookup(f"docsum keys={list(docsum.keys()) if docsum else []}")
+
+        if not genomic_info:
+            log_gene_lookup("no genomicinfo in docsum")
+            return None, "未在NCBI记录中找到基因坐标"
+
+        region = genomic_info[0]
+        chrom = (
+            region.get("ChrLoc")
+            or region.get("chr")
+            or docsum.get("chromosome")
+            or docsum.get("Chromosome")
+        )
+        start = (
+            region.get("ChrStart")
+            or region.get("chrstart")
+            or docsum.get("chrstart")
+        )
+        end = (
+            region.get("ChrStop")
+            or region.get("chrstop")
+            or docsum.get("chrstop")
+        )
+
+        log_gene_lookup(
+            f"region keys={list(region.keys())}; raw chrom={chrom} start={start} end={end}"
+        )
+
+        if start is None or end is None or chrom is None:
+            log_gene_lookup(
+                f"missing fields after fallback chrom={chrom} start={start} end={end}; docsum keys={list(docsum.keys())}"
+            )
+            return None, "NCBI返回数据不完整，缺少染色体或坐标"
+
+        # 标准化染色体格式
+        chrom_str = str(chrom)
+        if chrom_str.upper() in ["MT", "M"]:
+            chrom_str = "chrM"
+        elif not chrom_str.lower().startswith("chr"):
+            chrom_str = f"chr{chrom_str}"
+
+        start_pos = int(min(start, end))
+        end_pos = int(max(start, end))
+        center_pos = int((start_pos + end_pos) / 2)
+
+        log_gene_lookup(f"parsed chrom={chrom_str} start={start_pos} end={end_pos} center={center_pos}")
+
+        return {
+            "gene_id": gene_id,
+            "chromosome": chrom_str,
+            "start": start_pos,
+            "end": end_pos,
+            "center": center_pos,
+            "strand": region.get("ChrStrand"),
+            "map_location": docsum.get("maplocation") or docsum.get("MapLocation"),
+            "summary": docsum.get("summary") or docsum.get("Summary"),
+        }, "查询成功"
+    except requests.RequestException as req_err:
+        log_gene_lookup(f"request error: {req_err}")
+        return None, f"网络请求失败: {req_err}"
+    except Exception as e:
+        log_gene_lookup(f"parse error: {e}")
+        return None, f"解析NCBI返回数据失败: {e}"
 
 def run_script(script_path, params):
     """运行pipeline脚本"""
@@ -976,39 +1157,7 @@ def display_results(project_name, params, work_dir):
             st.info("💡 请检查结果文件夹路径是否正确，或等待文件生成")
         
         st.markdown("---")
-        
-        # 原有的分析结果显示（如果有的话）
-        original_result_file = os.path.join(work_dir, f"{params['name']}_result.tar.gz")
-        if os.path.exists(original_result_file):
-            st.markdown("### 📦 分析结果")
-            
-            # 显示文件信息（简化版，不显示大小）
-            st.info(f"📁 结果文件: {os.path.basename(original_result_file)}")
-            
-            # 下载按钮
-            download_link = get_file_download_link(original_result_file, f"📥 下载 {os.path.basename(original_result_file)}")
-            st.markdown(download_link, unsafe_allow_html=True)
-            
-            # 显示解压后的文件列表
-            st.markdown("### 📋 包含文件")
-            try:
-                import tarfile
-                with tarfile.open(original_result_file, 'r:gz') as tar:
-                    file_list = tar.getnames()
-                    for file in file_list:
-                        st.write(f"- {file}")
-            except Exception as e:
-                st.warning(f"无法读取压缩包内容: {e}")
-    
-    # 处理 WORF-Seq 项目的结果显示
-    elif project_name == "WORF-Seq" and params.get('folder_name'):
-        folder_name = params['folder_name']
-        folder_basename = os.path.basename(folder_name)
-        chromosome = params.get('chromosome', 'chr6')
-        center_position = params.get('center_position', 0)
-        
-        st.markdown("## 📊 WORF-Seq 分析结果")
-        st.markdown("---")
+        return
         
         # 分析参数概览
         st.markdown("### 🔍 分析参数")
@@ -1206,6 +1355,105 @@ def display_results(project_name, params, work_dir):
         else:
             st.info("未找到生成文件")
 
+    # 新增 WORF-Seq 结果展示（重定位临时目录 + 打包下载 PNG/TXT）
+    if project_name == "WORF-Seq" and params.get("folder_name"):
+        folder_input = params["folder_name"]
+        folder_basename = os.path.basename(folder_input)
+        chromosome = params.get("chromosome", "chr6")
+        center_position = params.get("center_position", 0)
+        step_size = params.get("step_size", 100000)
+        import glob
+
+        def dir_has_outputs(path):
+            if not os.path.exists(path):
+                return False
+            pngs = glob.glob(os.path.join(path, "*.png"))
+            txts = glob.glob(os.path.join(path, "*worf_seq_summary.txt"))
+            return len(pngs) + len(txts) > 0
+
+        candidates = [folder_input] + glob.glob(f"/tmp/worf_seq_{folder_basename}_*")
+        result_dir = next((p for p in candidates if dir_has_outputs(p)), candidates[0])
+
+        if result_dir != folder_input:
+            st.warning(f"已从临时目录加载结果: {result_dir}")
+
+        st.markdown("## 📊 WORF-Seq 分析结果")
+        st.markdown("### 🔍 结果目录")
+        st.info(f"📁 使用目录: {result_dir}")
+
+        # 尝试查找实际生成的文件（兼容多种命名格式，包含旧的带有对齐后缀的名字）
+        import fnmatch
+
+        def find_result_file(dirpath, pattern_glob):
+            matches = glob.glob(os.path.join(dirpath, pattern_glob))
+            return matches[0] if matches else None
+
+        # 支持两类命名：1) {sample}_target_region_chr_pos.png 2) {sample}_aligned_minimap.sorted_target_region_chr_pos.png
+        target_patterns = [f"{folder_basename}_target_region_{chromosome}_{center_position}.png",
+                           f"{folder_basename}_*target_region_{chromosome}_{center_position}.png"]
+        chrom_patterns = [f"{folder_basename}_chromosome_{chromosome}_step{step_size}.png",
+                          f"{folder_basename}_*chromosome_{chromosome}_step{step_size}.png"]
+        summary_patterns = [f"{folder_basename}_worf_seq_summary.txt",
+                            f"{folder_basename}_*worf_seq_summary.txt"]
+
+        target_png = None
+        chrom_png = None
+        summary_txt = None
+        for p in target_patterns:
+            found = find_result_file(result_dir, p)
+            if found:
+                target_png = found
+                break
+        for p in chrom_patterns:
+            found = find_result_file(result_dir, p)
+            if found:
+                chrom_png = found
+                break
+        for p in summary_patterns:
+            found = find_result_file(result_dir, p)
+            if found:
+                summary_txt = found
+                break
+
+        # 单文件下载（不含 BAM）
+        st.markdown("### 📥 结果下载 (不含BAM)")
+        for fpath, label in [
+            (target_png, "下载目标区域图"),
+            (chrom_png, "下载全染色体图"),
+            (summary_txt, "下载报告(txt)")
+        ]:
+            if fpath and os.path.exists(fpath):
+                st.markdown(get_file_download_link(fpath, f"📥 {label}"), unsafe_allow_html=True)
+            else:
+                # 显示期望文件名以便用户参考
+                expected_name = label
+                if label == "下载目标区域图":
+                    expected_name = f"{folder_basename}_target_region_{chromosome}_{center_position}.png"
+                elif label == "下载全染色体图":
+                    expected_name = f"{folder_basename}_chromosome_{chromosome}_step{step_size}.png"
+                elif label == "下载报告(txt)":
+                    expected_name = f"{folder_basename}_worf_seq_summary.txt"
+                st.info(f"未找到文件: {expected_name}")
+
+        # 打包下载（仅 PNG + TXT，排除 BAM）
+        bundle_candidates = [p for p in [target_png, chrom_png, summary_txt] if p and os.path.exists(p)]
+        if bundle_candidates:
+            import tarfile
+            bundle_name = f"{folder_basename}_worf_seq_results.tar.gz"
+            bundle_path = os.path.join(result_dir, bundle_name)
+            try:
+                with tarfile.open(bundle_path, "w:gz") as tar:
+                    for f in bundle_candidates:
+                        tar.add(f, arcname=os.path.basename(f))
+                st.success(f"已打包 {len(bundle_candidates)} 个文件")
+                st.markdown(get_file_download_link(bundle_path, f"📦 下载 {bundle_name}"), unsafe_allow_html=True)
+            except Exception as e:
+                st.error(f"打包失败: {e}")
+        else:
+            st.info("未找到可打包的PNG/TXT结果")
+
+        return
+
 def display_log_files(work_dir, analysis_name):
     """显示和分析日志文件"""
     st.markdown("### 📜 日志文件管理")
@@ -1401,10 +1649,7 @@ def main():
                         type="primary" if project_config["status"] == "available" else "secondary"
                     ):
                         st.session_state.selected_project = project_key
-                        if hasattr(st, 'experimental_rerun'):
-                            st.experimental_rerun()
-                        else:
-                            st.rerun()
+                        st.rerun()
         
         # 留言板功能
         st.markdown("---")
@@ -1462,10 +1707,7 @@ def main():
     # 返回按钮
     if st.button("⬅️ 返回项目选择"):
         st.session_state.selected_project = None
-        if hasattr(st, 'experimental_rerun'):
-            st.experimental_rerun()
-        else:
-            st.rerun()
+        st.rerun()
     
     st.markdown("---")
     
@@ -1531,6 +1773,117 @@ def main():
     params = {}
     col1, col2 = st.columns(2)
     file_checks = {}
+
+    # WORF-Seq: 基因到坐标的快捷填充
+    if selected_project == "WORF-Seq":
+        st.markdown("### 🔎 基因定位助手 (NCBI)")
+        with st.expander("输入基因符号，一键获取染色体与起止坐标并自动填充", expanded=False):
+            gene_symbol_key = f"{selected_project}_gene_symbol"
+            organism_key = f"{selected_project}_organism"
+            st.session_state.setdefault(gene_symbol_key, "")
+            st.session_state.setdefault(organism_key, "Homo sapiens")
+
+            gene_symbol = st.text_input(
+                "🧬 基因符号 (官方HGNC/基因符号，如 HLA-C, TP53)",
+                value=st.session_state.get(gene_symbol_key, ""),
+                key=gene_symbol_key,
+                help="请输入官方基因符号（HGNC/RefSeq Gene Symbol），例如 TP53、HLA-C；支持同义词但以官方符号最稳"
+            )
+
+            organism_options = ["Homo sapiens", "Mus musculus", "Rattus norvegicus", "Danio rerio"]
+            default_org = st.session_state.get(organism_key, "Homo sapiens")
+            try:
+                default_org_idx = organism_options.index(default_org)
+            except ValueError:
+                default_org_idx = 0
+
+            organism = st.selectbox(
+                "🌍 物种",
+                options=organism_options,
+                index=default_org_idx,
+                key=organism_key,
+                help="用于NCBI检索的物种过滤"
+            )
+
+            lookup_btn = st.button("🔎 从NCBI获取坐标", key=f"lookup_gene_{selected_project}")
+            if lookup_btn:
+                with st.spinner("正在查询NCBI基因坐标..."):
+                    gene_info, msg = fetch_gene_coordinates(gene_symbol.strip(), organism)
+                if gene_info:
+                    # 写入session state，供下方参数默认值使用
+                    st.session_state[f"{selected_project}_chromosome"] = gene_info["chromosome"]
+                    st.session_state[f"{selected_project}_center_position"] = gene_info["center"]
+                    st.session_state[f"{selected_project}_gene_region"] = gene_info
+                    st.success(
+                        f"已获取 {gene_symbol.upper()} ({organism}) 坐标: {gene_info['chromosome']}:{gene_info['start']:,}-{gene_info['end']:,}"
+                    )
+                    st.info("已自动填充染色体与中心坐标，可在下方继续调整")
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+            st.caption(f"调试日志: logs/gene_lookup.log (自动记录最近查询)")
+
+            # 收藏夹操作区域
+            favs = load_gene_favorites()
+            if favs:
+                fav_options = [
+                    f"{fav['symbol']} ({fav['organism']}) {fav['chromosome']}:{fav['start']}-{fav['end']}"
+                    for fav in favs
+                ]
+                applied_key = f"{selected_project}_fav_applied"
+                st.session_state.setdefault(applied_key, "- 选择收藏 -")
+
+                options = ["- 选择收藏 -"] + fav_options
+                default_idx = options.index(st.session_state.get(applied_key, "- 选择收藏 -")) if st.session_state.get(applied_key, "- 选择收藏 -") in options else 0
+
+                selected_fav = st.selectbox(
+                    "⭐ 基因收藏夹（点击选择直接使用，无需再次查询）",
+                    options=options,
+                    index=default_idx,
+                    key=f"{selected_project}_fav_select",
+                )
+                if selected_fav != "- 选择收藏 -" and st.session_state.get(applied_key) != selected_fav:
+                    idx = fav_options.index(selected_fav)
+                    chosen = favs[idx]
+                    st.session_state[f"{selected_project}_chromosome"] = chosen["chromosome"]
+                    st.session_state[f"{selected_project}_center_position"] = chosen["center"]
+                    st.session_state[f"{selected_project}_gene_region"] = {
+                        "chromosome": chosen["chromosome"],
+                        "start": chosen["start"],
+                        "end": chosen["end"],
+                        "center": chosen["center"],
+                        "map_location": None,
+                        "summary": None,
+                    }
+                    st.session_state[applied_key] = selected_fav
+                    st.success(f"已应用收藏: {chosen['symbol']} ({chosen['organism']})")
+
+            # 查询成功后允许收藏
+            if st.session_state.get(f"{selected_project}_gene_region"):
+                current_region = st.session_state[f"{selected_project}_gene_region"]
+                already_saved = any(
+                    fav.get("symbol", "").upper() == gene_symbol.strip().upper()
+                    and fav.get("organism") == organism
+                    for fav in favs
+                ) if favs else False
+                col_fav_btn, _ = st.columns([1, 3])
+                with col_fav_btn:
+                    if st.button("⭐ 收藏当前基因", key=f"fav_btn_{selected_project}", disabled=already_saved):
+                        added = add_gene_favorite(gene_symbol, organism, current_region)
+                        if added:
+                            st.success("已加入收藏夹")
+                        else:
+                            st.info("已在收藏夹中")
+                        st.rerun()
+
+            gene_region = st.session_state.get(f"{selected_project}_gene_region")
+            if gene_region:
+                st.markdown(
+                    f"**最新查询:** {gene_region['chromosome']}:{gene_region['start']:,}-{gene_region['end']:,} (中心 {gene_region['center']:,})"
+                )
+                if gene_region.get("map_location"):
+                    st.caption(f"图谱位置: {gene_region['map_location']}")
     
     for i, (param_key, param_config) in enumerate(project_config["params"].items()):
         col = col1 if i % 2 == 0 else col2
@@ -1814,10 +2167,7 @@ def main():
                     st.session_state.process.terminate()
                 st.session_state.running = False
                 st.session_state.output.append("\n⏹️ 用户停止执行")
-                if hasattr(st, 'experimental_rerun'):
-                    st.experimental_rerun()
-                else:
-                    st.rerun()
+                st.rerun()
     
     # 输出区域
     if st.session_state.get('running', False) or st.session_state.get('output') or st.session_state.get('log_file'):
@@ -1995,10 +2345,7 @@ def main():
                 
                 # 操作按钮
                 if st.button("🔄 刷新状态", key="refresh_status", use_container_width=True):
-                    if hasattr(st, 'experimental_rerun'):
-                        st.experimental_rerun()
-                    else:
-                        st.rerun()
+                    st.rerun()
         
         # 如果有session state的output，也显示（兼容性）
         elif st.session_state.get('output'):
@@ -2078,10 +2425,7 @@ def main():
                         if os.path.exists(result_file):
                             st.success("✅ 发现结果文件！")
                             display_results(selected_project, params, work_dir)
-                            if hasattr(st, 'experimental_rerun'):
-                                st.experimental_rerun()
-                            else:
-                                st.rerun()
+                            st.rerun()
                         else:
                             st.warning("⚠️ 结果文件尚未生成，请稍后重试")
     
@@ -2130,10 +2474,7 @@ def main():
             with col2:
                 if st.button("📊 查看结果", key="view_results_final", use_container_width=True):
                     display_results(selected_project, params, work_dir)
-                    if hasattr(st, 'experimental_rerun'):
-                        st.experimental_rerun()
-                    else:
-                        st.rerun()
+                    st.rerun()
         else:
             # 如果文件不存在，提供搜索功能
             st.markdown("---")
@@ -2158,10 +2499,7 @@ def main():
                             temp_params = params.copy()
                             temp_params['name'] = selected_file.replace('_result.csv', '').replace('.csv', '')
                             display_results(selected_project, temp_params, work_dir)
-                            if hasattr(st, 'experimental_rerun'):
-                                st.experimental_rerun()
-                            else:
-                                st.rerun()
+                            st.rerun()
                 else:
                     st.warning("⚠️ 工作目录中没有找到CSV文件")
             else:
